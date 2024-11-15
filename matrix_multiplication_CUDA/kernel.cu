@@ -8,6 +8,19 @@ void print_matrix(int N, int M, double* matrix);
 
 #define BLOCK_SIZE 32
 
+template <typename Func, typename... Args>
+void run_dgemmCUDA(Func f, const double* d_A, const double* d_B, double* d_C, int N, int M, int K)
+{
+    /* Set size block (BLOCK_SIZE x BLOCK_SIZE) */
+    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
+
+    /* Each block thread a part of the matrix with the size BLOCK_SIZE x BLOCK_SIZE */
+    dim3 dimGrid((K + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    /* Run CUDA-core */
+    f << <dimGrid, dimBlock >> > (d_A, d_B, d_C, N, M, K);
+}
+
 __global__ void blas_dgemmCUDAv1(const double* A, const double* B, double* C, int N, int M, int K)
 {
     int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
@@ -24,19 +37,8 @@ __global__ void blas_dgemmCUDAv1(const double* A, const double* B, double* C, in
     }
 }
 
-void run_dgemmCUDAv1(const double* d_A, const double* d_B, double* d_C, int N, int M, int K)
+__global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, int N, int M, int K) 
 {
-    /* Set size block (BLOCK_SIZE x BLOCK_SIZE) */
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
-
-    /* Each block thread a part of the matrix with the size BLOCK_SIZE x BLOCK_SIZE */
-    dim3 dimGrid((K + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
-
-    /* Run CUDA-core */
-    blas_dgemmCUDAv1 << <dimGrid, dimBlock >> > (d_A, d_B, d_C, N, M, K);
-}
-
-__global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, int N, int M, int K) {
     // Размер блоков
     __shared__ double tileA[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ double tileB[BLOCK_SIZE][BLOCK_SIZE];
@@ -55,7 +57,8 @@ __global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, in
         {
             tileA[threadIdx.y][threadIdx.x] = A[row * M + i * BLOCK_SIZE + threadIdx.x];
         }
-        else {
+        else 
+        {
             tileA[threadIdx.y][threadIdx.x] = 0.0;
         }
 
@@ -63,7 +66,8 @@ __global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, in
         {
             tileB[threadIdx.y][threadIdx.x] = B[(i * BLOCK_SIZE + threadIdx.y) * K + col];
         }
-        else {
+        else 
+        {
             tileB[threadIdx.y][threadIdx.x] = 0.0;
         }
 
@@ -84,22 +88,42 @@ __global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, in
     }
 }
 
-void run_dgemmCUDAv2(const double* d_A, const double* d_B, double* d_C, int N, int M, int K)
+__global__ void blas_dgemmCUDAv3(const double* A, const double* B, double* C, int N, int M, int K) 
 {
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 dimGrid((K + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    // Разделяемая память с выравниванием
+    __shared__ double sharedA[BLOCK_SIZE][BLOCK_SIZE + 1]; // Добавляем +1 для устранения конфликтов
+    __shared__ double sharedB[BLOCK_SIZE][BLOCK_SIZE + 1]; // Аналогично для матрицы B
 
-    blas_dgemmCUDAv2 << <dimGrid, dimBlock >> > (d_A, d_B, d_C, N, M, K);
-}
+    int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+    int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    double sum = 0.0;
 
-void transpose_matrix(const double* B, double* B_transposed, int M, int K) 
-{
-    for (int i = 0; i < M; ++i) 
+    for (int t = 0; t < (M + BLOCK_SIZE - 1) / BLOCK_SIZE; ++t) 
     {
-        for (int j = 0; j < K; ++j) 
+        // Загрузка данных в разделяемую память
+        if (row < N && t * BLOCK_SIZE + threadIdx.x < M)
+            sharedA[threadIdx.y][threadIdx.x] = A[row * M + t * BLOCK_SIZE + threadIdx.x];
+        else
+            sharedA[threadIdx.y][threadIdx.x] = 0.0;
+
+        if (col < K && t * BLOCK_SIZE + threadIdx.y < M)
+            sharedB[threadIdx.y][threadIdx.x] = B[(t * BLOCK_SIZE + threadIdx.y) * K + col];
+        else
+            sharedB[threadIdx.y][threadIdx.x] = 0.0;
+
+        __syncthreads();
+
+        // Вычисления
+        for (int i = 0; i < BLOCK_SIZE; ++i) 
         {
-            B_transposed[j * M + i] = B[i * K + j];
+            sum += sharedA[threadIdx.y][i] * sharedB[i][threadIdx.x];
         }
+        __syncthreads();
+    }
+
+    if (row < N && col < K) 
+    {
+        C[row * K + col] = sum;
     }
 }
 
@@ -124,9 +148,6 @@ int main(int argc, char** argv)
     double* B = (double*)malloc(M * K * sizeof(double));
     double* C = (double*)malloc(N * K * sizeof(double));
 
-    double* B_transposed = (double*)malloc(M * K * sizeof(double));
-    transpose_matrix(B, B_transposed, M, K);
-
     if (!A || !B || !C)
     {
         fprintf(stderr, "Memory allocation failed\n");
@@ -144,14 +165,14 @@ int main(int argc, char** argv)
 
     /* Copy arrays A, B and C out host memory in device memory*/
     cudaMemcpy(d_A, A, N * M * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B_transposed, M * K * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B, M * K * sizeof(double), cudaMemcpyHostToDevice);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    run_dgemmCUDAv2(d_A, d_B, d_C, N, M, K);
+    run_dgemmCUDA(blas_dgemmCUDAv3, d_A, d_B, d_C, N, M, K);
 
     cudaEventRecord(stop);
 

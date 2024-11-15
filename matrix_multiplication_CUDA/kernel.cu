@@ -1,5 +1,6 @@
 ﻿#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include <cublas_v2.h>
 #include <stdio.h>
 #include <cstdlib>
 
@@ -9,8 +10,15 @@ void print_matrix(int N, int M, double* matrix);
 #define BLOCK_SIZE 32
 
 template <typename Func, typename... Args>
-void run_dgemmCUDA(Func f, const double* d_A, const double* d_B, double* d_C, int N, int M, int K)
+void run_dgemmCUDA(const char* func_name, Func f, const double* d_A, const double* d_B, double* d_C, int N, int M, int K)
 {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    /* Start measuring time */
+    cudaEventRecord(start);
+
     /* Set size block (BLOCK_SIZE x BLOCK_SIZE) */
     dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
 
@@ -19,6 +27,58 @@ void run_dgemmCUDA(Func f, const double* d_A, const double* d_B, double* d_C, in
 
     /* Run CUDA-core */
     f << <dimGrid, dimBlock >> > (d_A, d_B, d_C, N, M, K);
+
+    /* End measuring time */
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    /* Calc time running */
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    printf("%s time elapsed = %f ms\n", func_name, milliseconds);
+
+    // Очистка ресурсов событий
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
+
+void run_cublasDgemm(const double* d_A, const double* d_B, double* d_C, int N, int M, int K) 
+{
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    /* Start measuring time */
+    cudaEventRecord(start);
+
+    cublasHandle_t handle;
+
+    /* Create context cuBLAS*/
+    cublasCreate(&handle);
+
+    /*Coeffs for operation (alpha * A * B + beta * C) */ 
+    const double alpha = 1.0;
+    const double beta = 0.0;
+
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, K, N, M, &alpha, d_B, K, d_A, M, &beta, d_C, K);                 
+
+    /* Free context cuBLAS */
+    cublasDestroy(handle);
+
+    /* End measuring time */
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    /* Calc time running */
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    printf("cuBLAS v2 time elapsed = %f ms\n", milliseconds);
+
+    // Очистка ресурсов событий
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
 __global__ void blas_dgemmCUDAv1(const double* A, const double* B, double* C, int N, int M, int K)
@@ -167,21 +227,19 @@ int main(int argc, char** argv)
     cudaMemcpy(d_A, A, N * M * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, B, M * K * sizeof(double), cudaMemcpyHostToDevice);
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
+    /* Run core use global memory */
+    run_dgemmCUDA("Global memory kernel (v1)", blas_dgemmCUDAv1, d_A, d_B, d_C, N, M, K);
 
-    run_dgemmCUDA(blas_dgemmCUDAv3, d_A, d_B, d_C, N, M, K);
+    /* Run core use shared memory */
+    run_dgemmCUDA("Shared memory kernel (v2)", blas_dgemmCUDAv2, d_A, d_B, d_C, N, M, K);
 
-    cudaEventRecord(stop);
+    /* Run core use shared-padding memory */
+    run_dgemmCUDA("Shared memory with padding (v3)", blas_dgemmCUDAv3, d_A, d_B, d_C, N, M, K);
+
+    /* Run core use cublas */
+    run_cublasDgemm(d_A, d_B, d_C, N, M, K);
 
     cudaMemcpy(C, d_C, N * K * sizeof(double), cudaMemcpyDeviceToHost);
-
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Matrix multiplication took %f milliseconds.\n", milliseconds);
 
     cudaFree(d_A);
     cudaFree(d_B);

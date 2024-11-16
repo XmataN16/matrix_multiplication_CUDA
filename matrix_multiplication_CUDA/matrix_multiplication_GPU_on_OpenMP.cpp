@@ -1,7 +1,6 @@
 ﻿#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <cublas_v2.h>
-#include <omp.h>
 #include <stdio.h>
 #include <cstdlib>
 
@@ -9,66 +8,6 @@ void init_matrix(int N, int M, int K, double* A, double* B, double* C);
 void print_matrix(int N, int M, double* matrix);
 
 #define BLOCK_SIZE 32
-
-void transfer_data_to_GPU(int method, double* A, double* B, double* C, double** d_A, double** d_B, double** d_C, int N, int M, int K)
-{
-    switch (method)
-    {
-    case 0: // Standard allocate
-        cudaMalloc((void**)d_A, N * M * sizeof(double));
-        cudaMalloc((void**)d_B, M * K * sizeof(double));
-        cudaMalloc((void**)d_C, N * K * sizeof(double));
-
-        /* Copy arrays A, B and C from host memory to device memory */
-        cudaMemcpy(*d_A, A, N * M * sizeof(double), cudaMemcpyHostToDevice);
-        cudaMemcpy(*d_B, B, M * K * sizeof(double), cudaMemcpyHostToDevice);
-        cudaMemcpy(*d_C, C, N * K * sizeof(double), cudaMemcpyHostToDevice);
-        break;
-
-    case 1: // Pinned memory
-        cudaHostAlloc((void**)&A, N * M * sizeof(double), cudaHostAllocDefault);
-        cudaHostAlloc((void**)&B, M * K * sizeof(double), cudaHostAllocDefault);
-        cudaHostAlloc((void**)&C, N * K * sizeof(double), cudaHostAllocDefault);
-
-        cudaMalloc((void**)d_A, N * M * sizeof(double));
-        cudaMalloc((void**)d_B, M * K * sizeof(double));
-        cudaMalloc((void**)d_C, N * K * sizeof(double));
-
-        cudaMemcpy(*d_A, A, N * M * sizeof(double), cudaMemcpyHostToDevice);
-        cudaMemcpy(*d_B, B, M * K * sizeof(double), cudaMemcpyHostToDevice);
-        cudaMemcpy(*d_C, C, N * K * sizeof(double), cudaMemcpyHostToDevice);
-        break;
-
-    case 2: // Unified memory
-        cudaMallocManaged(d_A, N * M * sizeof(double));
-        cudaMallocManaged(d_B, M * K * sizeof(double));
-        cudaMallocManaged(d_C, N * K * sizeof(double));
-        break;
-
-    case 3: // CUDA streams
-        cudaStream_t stream1, stream2;
-        cudaStreamCreate(&stream1);
-        cudaStreamCreate(&stream2);
-
-        cudaMalloc((void**)d_A, N * M * sizeof(double));
-        cudaMalloc((void**)d_B, M * K * sizeof(double));
-        cudaMalloc((void**)d_C, N * K * sizeof(double));
-
-        cudaMemcpyAsync(*d_A, A, N * M * sizeof(double), cudaMemcpyHostToDevice, stream1);
-        cudaMemcpyAsync(*d_B, B, M * K * sizeof(double), cudaMemcpyHostToDevice, stream2);
-
-        cudaStreamSynchronize(stream1);
-        cudaStreamSynchronize(stream2);
-
-        cudaStreamDestroy(stream1);
-        cudaStreamDestroy(stream2);
-        break;
-
-    default:
-        fprintf(stderr, "Unknown transfer method.\n");
-        exit(1);
-    }
-}
 
 template <typename Func, typename... Args>
 void run_dgemmCUDA(const char* func_name, Func f, const double* d_A, const double* d_B, double* d_C, int N, int M, int K)
@@ -280,7 +219,13 @@ int main(int argc, char** argv)
     /* Allocation of memory for arrays A, B and result matrix C (device)*/
     double* d_A, * d_B, * d_C;
 
-    transfer_data_to_GPU(3, A, B, C, &d_A, &d_B, &d_C, N, M, K);
+    cudaMalloc((void**)&d_A, N * M * sizeof(double));
+    cudaMalloc((void**)&d_B, M * K * sizeof(double));
+    cudaMalloc((void**)&d_C, N * K * sizeof(double));
+
+    /* Copy arrays A, B and C out host memory in device memory*/
+    cudaMemcpy(d_A, A, N * M * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B, M * K * sizeof(double), cudaMemcpyHostToDevice);
 
     /* Run core use global memory */
     run_dgemmCUDA("Global memory kernel (v1)", blas_dgemmCUDAv1, d_A, d_B, d_C, N, M, K);

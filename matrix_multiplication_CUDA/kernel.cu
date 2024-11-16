@@ -110,7 +110,6 @@ void run_dgemmCUDA(const char* func_name, Func f, const double* d_A, const doubl
 
     printf("%s time elapsed = %f ms\n", func_name, milliseconds);
 
-    // Очистка ресурсов событий
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 }
@@ -171,20 +170,19 @@ __global__ void blas_dgemmCUDAv1(const double* A, const double* B, double* C, in
 
 __global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, int N, int M, int K) 
 {
-    // Размер блоков
+    /* Blocks size */
     __shared__ double tileA[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ double tileB[BLOCK_SIZE][BLOCK_SIZE];
 
-    // Индексы строки и столбца для матрицы C
+    /* Set indexes threads in blocks */
     int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
     int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
 
     double sum = 0.0;
 
-    // Обход всех "подблоков" A и B по горизонтали и вертикали соответственно
     for (int i = 0; i < (M + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i) 
     {
-        // Загрузка элементов в shared memory
+        /* Load elements in shared memory */
         if (row < N && i * BLOCK_SIZE + threadIdx.x < M) 
         {
             tileA[threadIdx.y][threadIdx.x] = A[row * M + i * BLOCK_SIZE + threadIdx.x];
@@ -205,7 +203,7 @@ __global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, in
 
         __syncthreads();
 
-        // Умножение текущих подблоков A и B
+        /* Mul current subblock*/
         for (int j = 0; j < BLOCK_SIZE; ++j) 
         {
             sum += tileA[threadIdx.y][j] * tileB[j][threadIdx.x];
@@ -214,17 +212,18 @@ __global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, in
         __syncthreads();
     }
 
-    // Запись результата в глобальную память
-    if (row < N && col < K) {
+    /* Write result subblock in global memory */
+    if (row < N && col < K) 
+    {
         C[row * K + col] = sum;
     }
 }
 
 __global__ void blas_dgemmCUDAv3(const double* A, const double* B, double* C, int N, int M, int K) 
 {
-    // Разделяемая память с выравниванием
-    __shared__ double sharedA[BLOCK_SIZE][BLOCK_SIZE + 1]; // Добавляем +1 для устранения конфликтов
-    __shared__ double sharedB[BLOCK_SIZE][BLOCK_SIZE + 1]; // Аналогично для матрицы B
+    /* paddings */
+    __shared__ double sharedA[BLOCK_SIZE][BLOCK_SIZE + 1]; // Add +1 for solutions conflicts
+    __shared__ double sharedB[BLOCK_SIZE][BLOCK_SIZE + 1];
 
     int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
     int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
@@ -232,7 +231,7 @@ __global__ void blas_dgemmCUDAv3(const double* A, const double* B, double* C, in
 
     for (int t = 0; t < (M + BLOCK_SIZE - 1) / BLOCK_SIZE; ++t) 
     {
-        // Загрузка данных в разделяемую память
+        /* Load elements in shared memory */
         if (row < N && t * BLOCK_SIZE + threadIdx.x < M)
             sharedA[threadIdx.y][threadIdx.x] = A[row * M + t * BLOCK_SIZE + threadIdx.x];
         else
@@ -245,7 +244,7 @@ __global__ void blas_dgemmCUDAv3(const double* A, const double* B, double* C, in
 
         __syncthreads();
 
-        // Вычисления
+
         for (int i = 0; i < BLOCK_SIZE; ++i) 
         {
             sum += sharedA[threadIdx.y][i] * sharedB[i][threadIdx.x];

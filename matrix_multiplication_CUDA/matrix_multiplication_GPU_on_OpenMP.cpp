@@ -1,191 +1,11 @@
-﻿#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-#include <cublas_v2.h>
-#include <stdio.h>
+﻿#include <stdio.h>
+#include <stdlib.h>
 #include <cstdlib>
+#include <omp.h>
 
 void init_matrix(int N, int M, int K, double* A, double* B, double* C);
 void print_matrix(int N, int M, double* matrix);
-
-#define BLOCK_SIZE 32
-
-template <typename Func, typename... Args>
-void run_dgemmCUDA(const char* func_name, Func f, const double* d_A, const double* d_B, double* d_C, int N, int M, int K)
-{
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    /* Start measuring time */
-    cudaEventRecord(start);
-
-    /* Set size block (BLOCK_SIZE x BLOCK_SIZE) */
-    dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
-
-    /* Each block thread a part of the matrix with the size BLOCK_SIZE x BLOCK_SIZE */
-    dim3 dimGrid((K + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
-
-    /* Run CUDA-core */
-    f << <dimGrid, dimBlock >> > (d_A, d_B, d_C, N, M, K);
-
-    /* End measuring time */
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    /* Calc time running */
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-
-    printf("%s time elapsed = %f ms\n", func_name, milliseconds);
-
-    // Очистка ресурсов событий
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-}
-
-void run_cublasDgemm(const double* d_A, const double* d_B, double* d_C, int N, int M, int K) 
-{
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    /* Start measuring time */
-    cudaEventRecord(start);
-
-    cublasHandle_t handle;
-
-    /* Create context cuBLAS*/
-    cublasCreate(&handle);
-
-    /*Coeffs for operation (alpha * A * B + beta * C) */ 
-    const double alpha = 1.0;
-    const double beta = 0.0;
-
-    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, K, N, M, &alpha, d_B, K, d_A, M, &beta, d_C, K);                 
-
-    /* Free context cuBLAS */
-    cublasDestroy(handle);
-
-    /* End measuring time */
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    /* Calc time running */
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-
-    printf("cuBLAS v2 time elapsed = %f ms\n", milliseconds);
-
-    // Очистка ресурсов событий
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-}
-
-__global__ void blas_dgemmCUDAv1(const double* A, const double* B, double* C, int N, int M, int K)
-{
-    int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
-    int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    double sum = 0.0;
-
-    if (row < N && col < K) 
-    {
-        for (int i = 0; i < M; ++i) 
-        {
-            sum += A[row * M + i] * B[i * K + col];
-        }
-        C[row * K + col] = sum;
-    }
-}
-
-__global__ void blas_dgemmCUDAv2(const double* A, const double* B, double* C, int N, int M, int K) 
-{
-    // Размер блоков
-    __shared__ double tileA[BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ double tileB[BLOCK_SIZE][BLOCK_SIZE];
-
-    // Индексы строки и столбца для матрицы C
-    int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
-    int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-
-    double sum = 0.0;
-
-    // Обход всех "подблоков" A и B по горизонтали и вертикали соответственно
-    for (int i = 0; i < (M + BLOCK_SIZE - 1) / BLOCK_SIZE; ++i) 
-    {
-        // Загрузка элементов в shared memory
-        if (row < N && i * BLOCK_SIZE + threadIdx.x < M) 
-        {
-            tileA[threadIdx.y][threadIdx.x] = A[row * M + i * BLOCK_SIZE + threadIdx.x];
-        }
-        else 
-        {
-            tileA[threadIdx.y][threadIdx.x] = 0.0;
-        }
-
-        if (col < K && i * BLOCK_SIZE + threadIdx.y < M) 
-        {
-            tileB[threadIdx.y][threadIdx.x] = B[(i * BLOCK_SIZE + threadIdx.y) * K + col];
-        }
-        else 
-        {
-            tileB[threadIdx.y][threadIdx.x] = 0.0;
-        }
-
-        __syncthreads();
-
-        // Умножение текущих подблоков A и B
-        for (int j = 0; j < BLOCK_SIZE; ++j) 
-        {
-            sum += tileA[threadIdx.y][j] * tileB[j][threadIdx.x];
-        }
-
-        __syncthreads();
-    }
-
-    // Запись результата в глобальную память
-    if (row < N && col < K) {
-        C[row * K + col] = sum;
-    }
-}
-
-__global__ void blas_dgemmCUDAv3(const double* A, const double* B, double* C, int N, int M, int K) 
-{
-    // Разделяемая память с выравниванием
-    __shared__ double sharedA[BLOCK_SIZE][BLOCK_SIZE + 1]; // Добавляем +1 для устранения конфликтов
-    __shared__ double sharedB[BLOCK_SIZE][BLOCK_SIZE + 1]; // Аналогично для матрицы B
-
-    int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
-    int col = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    double sum = 0.0;
-
-    for (int t = 0; t < (M + BLOCK_SIZE - 1) / BLOCK_SIZE; ++t) 
-    {
-        // Загрузка данных в разделяемую память
-        if (row < N && t * BLOCK_SIZE + threadIdx.x < M)
-            sharedA[threadIdx.y][threadIdx.x] = A[row * M + t * BLOCK_SIZE + threadIdx.x];
-        else
-            sharedA[threadIdx.y][threadIdx.x] = 0.0;
-
-        if (col < K && t * BLOCK_SIZE + threadIdx.y < M)
-            sharedB[threadIdx.y][threadIdx.x] = B[(t * BLOCK_SIZE + threadIdx.y) * K + col];
-        else
-            sharedB[threadIdx.y][threadIdx.x] = 0.0;
-
-        __syncthreads();
-
-        // Вычисления
-        for (int i = 0; i < BLOCK_SIZE; ++i) 
-        {
-            sum += sharedA[threadIdx.y][i] * sharedB[i][threadIdx.x];
-        }
-        __syncthreads();
-    }
-
-    if (row < N && col < K) 
-    {
-        C[row * K + col] = sum;
-    }
-}
+void blas_dgemmGPU_OpenMP(int N, int M, int K, double* A, double* B, double* C);
 
 int main(int argc, char** argv)
 {
@@ -203,7 +23,7 @@ int main(int argc, char** argv)
         N = M = K = 2000;
     }
 
-    /* Allocation of memory for arrays A, B and result matrix C (host)*/
+    /* Allocation of memory for arrays A, B and result matrix C */
     double* A = (double*)malloc(N * M * sizeof(double));
     double* B = (double*)malloc(M * K * sizeof(double));
     double* C = (double*)malloc(N * K * sizeof(double));
@@ -216,40 +36,17 @@ int main(int argc, char** argv)
 
     init_matrix(N, M, K, A, B, C);
 
-    /* Allocation of memory for arrays A, B and result matrix C (device)*/
-    double* d_A, * d_B, * d_C;
+    /* The start of the execution time */
+    double start_time = omp_get_wtime();
 
-    cudaMalloc((void**)&d_A, N * M * sizeof(double));
-    cudaMalloc((void**)&d_B, M * K * sizeof(double));
-    cudaMalloc((void**)&d_C, N * K * sizeof(double));
+    blas_dgemmGPU_OpenMP(N, M, K, A, B, C);
 
-    /* Copy arrays A, B and C out host memory in device memory*/
-    cudaMemcpy(d_A, A, N * M * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B, M * K * sizeof(double), cudaMemcpyHostToDevice);
+    /* The end of the execution time */
+    double end_time = omp_get_wtime();
 
-    /* Run core use global memory */
-    run_dgemmCUDA("Global memory kernel (v1)", blas_dgemmCUDAv1, d_A, d_B, d_C, N, M, K);
-    cudaDeviceSynchronize();
+    //print_matrix(N, M, C);
 
-    /* Run core use shared memory */
-    run_dgemmCUDA("Shared memory kernel (v2)", blas_dgemmCUDAv2, d_A, d_B, d_C, N, M, K);
-    cudaDeviceSynchronize();
-
-    /* Run core use shared-padding memory */
-    run_dgemmCUDA("Shared memory with padding (v3)", blas_dgemmCUDAv3, d_A, d_B, d_C, N, M, K);
-    cudaDeviceSynchronize();
-
-    /* Run core use cublas */
-    run_cublasDgemm(d_A, d_B, d_C, N, M, K);
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(C, d_C, N * K * sizeof(double), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-
-    //print_matrix(N, K, C);
+    printf("Execution time: %f seconds\n", end_time - start_time);
 
     /* Free allocated memory */
     free(A);
@@ -257,6 +54,29 @@ int main(int argc, char** argv)
     free(C);
 
     return 0;
+}
+
+/* Own implementation of the matrix multiplication function on GPU */
+void blas_dgemmGPU_OpenMP(int N, int M, int K, double* A, double* B, double* C) 
+{
+    /* Declare arrays "map(to/from)" for broadcast to GPU */
+    #pragma omp target data map(to: A[0:N*M], B[0:M*K]) map(from: C[0:N*K])
+    {
+        /* We distribute calculations into teams and streams */
+        #pragma omp target teams distribute parallel for collapse(2)
+        for (int i = 0; i < N; i++) 
+        {
+            for (int j = 0; j < K; j++) 
+            {
+                double sum = 0.0;
+                for (int k = 0; k < M; k++) 
+                {
+                    sum += A[i * M + k] * B[k * K + j];
+                }
+                C[i * K + j] = sum;
+            }
+        }
+    }
 }
 
 /* Function for displaying the matrix to the console */

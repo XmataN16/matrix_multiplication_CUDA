@@ -12,6 +12,13 @@ void print_matrix(int N, int M, double* matrix);
 
 void transfer_data_to_GPU(int method, double* A, double* B, double* C, double* &d_A, double* &d_B, double* &d_C, int N, int M, int K)
 {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    /* Start measuring time */
+    cudaEventRecord(start);
+
     switch (method)
     {
     case 0: // Standard allocate
@@ -79,6 +86,19 @@ void transfer_data_to_GPU(int method, double* A, double* B, double* C, double* &
         fprintf(stderr, "Unknown transfer method.\n");
         exit(1);
     }
+    /* End measuring time */
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    /* Calc time running */
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    printf("Data copy time elapsed = %f ms\n", milliseconds);
+
+    /* Clear resource events */
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
 template <typename Func, typename... Args>
@@ -110,6 +130,7 @@ void run_dgemmCUDA(const char* func_name, Func f, const double* d_A, const doubl
 
     printf("%s time elapsed = %f ms\n", func_name, milliseconds);
 
+    /* Clear resource events */
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 }
@@ -147,7 +168,7 @@ void run_cublasDgemm(const double* d_A, const double* d_B, double* d_C, int N, i
 
     printf("cuBLAS v2 time elapsed = %f ms\n", milliseconds);
 
-    // Очистка ресурсов событий
+    /* Clear resource events */
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 }
@@ -261,17 +282,20 @@ __global__ void blas_dgemmCUDAv3(const double* A, const double* B, double* C, in
 int main(int argc, char** argv)
 {
     /* Declaration variables of matrix sizes */
-    int N, M, K;
+    int N = 1000, M = 1000, K = 1000;
+
+    int data_copy_method = 3;
 
     /* Checking the number of command line arguments */
-    if (argc == 2)
+    if (argc == 3)
+    {
+        N = M = K = atoi(argv[1]);
+        data_copy_method = atoi(argv[2]);
+    }
+    else if (argc == 2)
     {
         /* Initialization of matrix sizes */
-        N = M = K = atoi(argv[0]);
-    }
-    else if (argc == 1)
-    {
-        N = M = K = 1000;
+        N = M = K = atoi(argv[1]);
     }
 
     /* Allocation of memory for arrays A, B and result matrix C (host)*/
